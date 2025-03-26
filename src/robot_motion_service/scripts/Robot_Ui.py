@@ -7,25 +7,18 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from robot_motion_service.srv import SetPosition, SolveIK
 import random
+import paho.mqtt.client as mqtt
+
+
+# MQTT Broker details
+BROKER = "test.mosquitto.org"
+PORT = 1883
+
 class RobotControlUI:
     def switch_controllers(self):
         import subprocess
         cmd = ["ros2", "control", "switch_controllers", "--activate", "joint_state_broadcaster", "--deactivate", "joint_trajectory_controller", "--activate", "velocity_controller"]
         subprocess.run(cmd)
-    def __init__(self, root, ros_node):
-        self.style = ttk.Style()
-        self.root = root
-        self.ros_node = ros_node
-        self.velocity = 0.5  # Default velocity
-        self.joint_names = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
-        self.current_joint = self.joint_names[0]
-        self.control_mode = "jog"  # Modes: 'jog', 'velocity', or 'cartesian'
-        self.client = self.ros_node.create_client(SetPosition, '/set_position')
-        self.solve_ik_client = self.ros_node.create_client(SolveIK, '/solve_ik')
-        
-        # Initialize kinematics for cartesian control
-        self.kinematics = None
-        self.init_kinematics()
         
     def __init__(self, root, ros_node):
         self.style = ttk.Style()
@@ -37,6 +30,18 @@ class RobotControlUI:
         self.control_mode = "jog"  # Modes: 'jog', 'velocity', or 'cartesian'
         self.client = self.ros_node.create_client(SetPosition, '/set_position')
         self.solve_ik_client = self.ros_node.create_client(SolveIK, '/solve_ik')
+
+        # กำหนดค่า joint_values เริ่มต้นที่นี่ เพื่อให้มีค่าอยู่ก่อนที่จะสร้าง UI
+        self.joint_values = {joint: 0.0 for joint in self.joint_names}
+        
+        self.mqtt_toggle_state = False  # MQTT toggle state
+        self.current_mode = None  # Default mode (None)
+        self.mqtt_client = None  # MQTT Client instance
+        self.robot_name = "fibotx1"  # Change this if needed
+        self.button_styles = {}  # เก็บสีเดิมของปุ่ม
+
+        self.cartesian_entries = {}
+        self.cartesian_labels = {}
         
         # Initialize kinematics for cartesian control
         self.kinematics = None
@@ -44,8 +49,8 @@ class RobotControlUI:
         # Default cartesian values - adjusted to be within workspace
         self.cartesian_values = {
             'x': 100.0,
-            'y': 0.0,
-            'z': 100.0,
+            'y': 100.0,
+            'z': 250.0,
             'roll': 0.0,
             'pitch': 0.0,
             'yaw': 0.0
@@ -149,6 +154,10 @@ class RobotControlUI:
             self.create_cartesian_ui()
     
     def create_jog_ui(self):
+        # ตรวจสอบว่ามีค่า joint_values อยู่แล้วหรือไม่ ถ้าไม่มีจึงสร้างขึ้นใหม่
+        if not hasattr(self, 'joint_values'):
+            self.joint_values = {joint: 0.0 for joint in self.joint_names}
+            
         ttk.Label(self.root, text="Select Joint", font=("Arial", 36)).pack(pady=20)
         self.joint_selector = ttk.Combobox(self.root, values=self.joint_names, state="readonly", font=("Arial", 44), width=30, postcommand=lambda: self.joint_selector.configure(height=10))
         self.joint_selector.bind('<Up>', lambda e: self.navigate_joint_selection(-1))
@@ -218,12 +227,18 @@ class RobotControlUI:
         self.btn_jog_plus.grid(row=0, column=1, padx=50)
         self.btn_jog_plus.bind("<ButtonPress>", lambda e: self.jog_positive())
         self.btn_jog_plus.bind("<ButtonRelease>", lambda e: self.stop_jog())
+        self.btn_home = ttk.Button(self.root, text="Home", bootstyle="primary", width=30, padding=30, command=self.execute_home)
+        self.btn_home.pack(pady=20)  # ✅ เพิ่ม padding เพื่อให้ปุ่มแสดง
+
     
     def create_velocity_ui(self):
-        # Create a simple title
         ttk.Label(self.root, text="Set Joint Angles", font=("Arial", 36)).pack(pady=20)
         
-        # Create a floating frame for special actions that won't affect layout
+        # ตรวจสอบว่ามีค่า joint_values อยู่แล้วหรือไม่ ถ้าไม่มีจึงสร้างขึ้นใหม่
+        if not hasattr(self, 'joint_values'):
+            self.joint_values = {joint: 0.0 for joint in self.joint_names}
+            
+        # คงค่า current_joint_index ไว้หากมีอยู่แล้ว หรือตั้งค่าเริ่มต้นถ้ายังไม่มีvelocity 
         # This frame will be positioned at the top-right corner
         self.special_frame = ttk.Frame(self.root)
         
@@ -279,16 +294,18 @@ class RobotControlUI:
         
         # Joint limits (degrees)
         self.joint_limits = {
-            'joint1': (-134, 134),
-            'joint2': (-90, 0),
-            'joint3': (-90, 45),
+            'joint1': (-180, 180),
+            'joint2': (-90, 90),
+            'joint3': (-90, 90),
             'joint4': (-180, 180),
             'joint5': (-180, 180),
             'joint6': (-180, 180)
         }
         
         # Initialize joint values dictionary to store entered values
-        self.joint_values = {joint: 0.0 for joint in self.joint_names}
+        if not hasattr(self, 'joint_values'):
+            self.joint_values = {joint: 0.0 for joint in self.joint_names}
+
         self.current_joint_index = 0
         
         # Create main frame
@@ -366,6 +383,15 @@ class RobotControlUI:
         self.next_button = ttk.Button(nav_frame, text="Next ▶", bootstyle="primary", 
                                      width=40, padding=30, command=self.next_joint)
         self.next_button.pack(side="left", padx=15)
+        # สร้าง Frame สำหรับแสดงข้อมูล MQTT
+        self.mqtt_data_frame = ttk.Frame(self.root)
+        self.mqtt_data_frame.pack(pady=10)
+
+        # สร้าง Label สำหรับแสดงข้อความที่ได้รับจาก MQTT
+        self.mqtt_data_label = ttk.Label(self.mqtt_data_frame, text="MQTT Data: Waiting for data...",
+                                        font=("Arial", 20), bootstyle="info")
+        self.mqtt_data_label.pack()
+
         
         # Action buttons next to navigation buttons
         action_frame = ttk.Frame(nav_action_frame)
@@ -375,7 +401,7 @@ class RobotControlUI:
         self.btn_send_angles = ttk.Button(
             action_frame, 
             text="Send Goal", 
-            bootstyle="success", 
+            bootstyle="secondary", 
             width=40, 
             padding=30, 
             command=self.send_joint_angles
@@ -391,7 +417,54 @@ class RobotControlUI:
             command=self.execute_home
         )
         self.btn_home.pack(side="left", padx=15)
-        
+        ######################################################
+            
+        # Frame สำหรับ MQTT Toggle
+        mqtt_toggle_frame = ttk.Frame(self.root)
+        mqtt_toggle_frame.pack(side="bottom", pady=10)
+
+        self.mqtt_toggle_label = ttk.Label(mqtt_toggle_frame, text="MQTT: OFF", font=("Arial", 24))
+        self.mqtt_toggle_label.pack(side="left", padx=20)
+
+        self.mqtt_toggle_button = ttk.Button(
+            mqtt_toggle_frame, 
+            text="Enable MQTT", 
+            bootstyle="success", 
+            width=20, 
+            padding=20, 
+            command=self.toggle_mqtt
+        )
+        self.mqtt_toggle_button.pack(side="left", padx=10)
+
+
+        ###################################################
+
+
+        self.cartesian_data_frame = ttk.Frame(self.root)
+
+        # กำหนดตำแหน่งให้อยู่ขวาล่างแต่ไม่ตกขอบ
+        self.cartesian_data_frame.place(relx=0.98, rely=0.98, anchor="se")
+
+
+        # Title Label
+        ttk.Label(self.cartesian_data_frame, text="Cartesian Data", font=("Arial", 18, "bold")).pack(anchor="w")
+
+        # Dictionary เก็บ Label สำหรับ X, Y, Z, Roll, Pitch, Yaw
+        self.cartesian_labels = {}
+        cartesian_params = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+
+        for param in cartesian_params:
+            frame = ttk.Frame(self.cartesian_data_frame)
+            frame.pack(anchor="w", pady=2)
+
+            ttk.Label(frame, text=f"{param}:", font=("Arial", 16)).pack(side="left")
+
+            label = ttk.Label(frame, text="0.0 mm" if param in ["X", "Y", "Z"] else "0.0°",
+                            font=("Arial", 16, "bold"))
+            label.pack(side="left", padx=10)
+
+            self.cartesian_labels[param] = label
+
         
         # Display saved values in a more compact way
         self.values_display_frame = ttk.Frame(main_frame)
@@ -422,6 +495,263 @@ class RobotControlUI:
             self.joint_value_labels[joint] = value_label
         
         self.update_values_display()
+    #####################################################
+    def update_cartesian_values(self, x, y, z, roll, pitch, yaw):
+        """อัปเดตค่า Cartesian Control UI"""
+        
+        self.ros_node.get_logger().info(f"🔄 Updating Cartesian Values: X={x}mm, Y={y}mm, Z={z}mm, Roll={roll}°, Pitch={pitch}°, Yaw={yaw}°")
+
+        # ตรวจสอบก่อนว่า entry widgets มีอยู่จริง
+        if self.cartesian_entries:
+            if "x" in self.cartesian_entries and self.cartesian_entries["x"].winfo_exists():
+                self.cartesian_entries['x'].delete(0, 'end')
+                self.cartesian_entries['x'].insert(0, str(x))
+
+            if "y" in self.cartesian_entries and self.cartesian_entries["y"].winfo_exists():
+                self.cartesian_entries['y'].delete(0, 'end')
+                self.cartesian_entries['y'].insert(0, str(y))
+
+            if "z" in self.cartesian_entries and self.cartesian_entries["z"].winfo_exists():
+                self.cartesian_entries['z'].delete(0, 'end')
+                self.cartesian_entries['z'].insert(0, str(z))
+
+            if "roll" in self.cartesian_entries and self.cartesian_entries["roll"].winfo_exists():
+                self.cartesian_entries['roll'].delete(0, 'end')
+                self.cartesian_entries['roll'].insert(0, str(roll))
+
+            if "pitch" in self.cartesian_entries and self.cartesian_entries["pitch"].winfo_exists():
+                self.cartesian_entries['pitch'].delete(0, 'end')
+                self.cartesian_entries['pitch'].insert(0, str(pitch))
+
+            if "yaw" in self.cartesian_entries and self.cartesian_entries["yaw"].winfo_exists():
+                self.cartesian_entries['yaw'].delete(0, 'end')
+                self.cartesian_entries['yaw'].insert(0, str(yaw))
+
+        # ✅ อัปเดต Label ที่มุมขวาล่าง
+        if self.cartesian_labels:
+            if "X" in self.cartesian_labels:
+                self.cartesian_labels["X"].config(text=f"{x:.2f} mm")
+
+            if "Y" in self.cartesian_labels:
+                self.cartesian_labels["Y"].config(text=f"{y:.2f} mm")
+
+            if "Z" in self.cartesian_labels:
+                self.cartesian_labels["Z"].config(text=f"{z:.2f} mm")
+
+            if "Roll" in self.cartesian_labels:
+                self.cartesian_labels["Roll"].config(text=f"{roll:.2f}°")
+
+            if "Pitch" in self.cartesian_labels:
+                self.cartesian_labels["Pitch"].config(text=f"{pitch:.2f}°")
+
+            if "Yaw" in self.cartesian_labels:
+                self.cartesian_labels["Yaw"].config(text=f"{yaw:.2f}°")
+
+        # ✅ Refresh UI
+        self.root.update()
+
+
+
+
+    def toggle_mqtt(self):
+        """เปิด-ปิด MQTT subscription และล้างค่าช่องกรอกเมื่อเปิด MQTT"""
+        self.mqtt_toggle_state = not self.mqtt_toggle_state  # Toggle สถานะ ON/OFF
+
+        if self.mqtt_toggle_state:
+            self.mqtt_toggle_label.config(text="MQTT: ON")
+            self.mqtt_toggle_button.config(text="Disable MQTT", bootstyle="danger")
+            self.start_mqtt_subscription()
+            self.ros_node.get_logger().info("MQTT Subscription: ENABLED")
+
+            # ✅ ล้างค่าช่องกรอกทั้งหมด
+            self.clear_all_entries()
+
+            # ✅ ปิดปุ่มทั้งหมดเมื่อเปิด MQTT
+            self.toggle_all_buttons("disable")
+
+        else:
+            self.mqtt_toggle_label.config(text="MQTT: OFF")
+            self.mqtt_toggle_button.config(text="Enable MQTT", bootstyle="success")
+            self.stop_mqtt_subscription()
+            self.ros_node.get_logger().info("MQTT Subscription: DISABLED")
+
+            # ✅ เปิดปุ่มทั้งหมดเมื่อปิด MQTT
+            self.toggle_all_buttons("enable")
+    def clear_all_entries(self):
+        """ล้างค่าช่องกรอกทั้งหมด และอัปเดต UI"""
+        self.ros_node.get_logger().info("🔄 Clearing all joint and Cartesian entries")
+
+        # ✅ ล้างค่าช่องกรอกของ Joint
+        if hasattr(self, 'current_joint_entry'):
+            self.current_joint_entry.delete(0, 'end')
+
+        for joint in self.joint_names:
+            self.joint_values[joint] = 0.0  # รีเซ็ตค่าเป็น 0
+            if joint in self.joint_value_labels:
+                self.joint_value_labels[joint].config(text="0.0°")  # ✅ อัปเดต Label ให้เปลี่ยนด้วย
+
+        # ✅ อัปเดตชื่อ Joint ปัจจุบัน
+        self.current_joint_label.config(text=f"Joint: {self.joint_names[self.current_joint_index]}")  
+
+        # ✅ ล้างค่าช่องกรอกของ Cartesian Control
+        for param in ["x", "y", "z", "roll", "pitch", "yaw"]:
+            if param in self.cartesian_entries:
+                self.cartesian_entries[param].delete(0, 'end')
+                self.cartesian_entries[param].insert(0, "0.0")
+                self.cartesian_values[param] = 0.0  # รีเซ็ตค่าเป็น 0
+
+            if param.capitalize() in self.cartesian_labels:
+                self.cartesian_labels[param.capitalize()].config(text="0.0 mm" if param in ["x", "y", "z"] else "0.0°")  
+
+        # ✅ รีเฟรช UI
+        self.root.update_idletasks()
+
+
+
+
+    def start_mqtt_subscription(self):
+        """เริ่มต้นรับค่าจาก MQTT"""
+        self.mqtt_client = mqtt.Client()
+        self.mqtt_client.on_connect = self.on_mqtt_connect
+        self.mqtt_client.on_message = self.on_mqtt_message
+
+        try:
+            self.mqtt_client.connect(BROKER, PORT, 60)
+            self.mqtt_client.subscribe(f"{self.robot_name}/pose")
+            self.mqtt_client.subscribe(f"{self.robot_name}/angles")
+            self.mqtt_client.loop_start()
+            self.ros_node.get_logger().info(f"Subscribed to MQTT topics for {self.robot_name}")
+        except Exception as e:
+            self.ros_node.get_logger().error(f"MQTT Connection Failed: {e}")
+
+    def stop_mqtt_subscription(self):
+        """หยุดการรับค่าจาก MQTT"""
+        if self.mqtt_client:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+            self.ros_node.get_logger().info("MQTT Disconnected")
+
+    def on_mqtt_connect(self, client, userdata, flags, rc):
+        """Callback เมื่อเชื่อมต่อกับ MQTT Broker"""
+        if rc == 0:
+            self.ros_node.get_logger().info("Connected to MQTT Broker")
+        else:
+            self.ros_node.get_logger().error(f"Failed to connect, return code {rc}")
+
+    def on_mqtt_message(self, client, userdata, msg):
+        try:
+            data = msg.payload.decode()
+            topic = msg.topic
+
+            self.mqtt_data_label.config(text=f"MQTT Data: {topic} -> {data}")
+            # self.toggle_all_buttons("enable")
+
+            if topic.endswith("/pose"):
+                x, y, z, roll, pitch, yaw = map(float, data.split(","))
+
+                x_mm, y_mm, z_mm = x , y , z 
+                roll_rad, pitch_rad, yaw_rad = math.radians(roll), math.radians(pitch), math.radians(yaw)
+
+                self.ros_node.get_logger().info(f"📥 Received Pose: X={x_mm}mm, Y={y_mm}mm, Z={z_mm}mm, Roll={roll}°, Pitch={pitch}°, Yaw={yaw}°")
+
+                # 🔄 ใช้ IK คำนวณ joint angles
+                if self.kinematics:
+                    joint_angles = self.kinematics.compute_ink([x/1000, y/1000, z/1000], [roll_rad, pitch_rad, yaw_rad])
+                    if joint_angles:
+                        joint_angles_deg = [math.degrees(angle) for angle in joint_angles]
+                        self.ros_node.get_logger().info(f"✅ IK Computed Joint Angles: {joint_angles_deg}")
+                        self.update_joint_angles(joint_angles_deg)
+                        self.root.update_idletasks()
+                        self.send_joint_angles()
+                        
+
+                # ✅ อัปเดต UI
+                self.update_cartesian_values(x_mm, y_mm, z_mm, roll, pitch, yaw)
+
+            elif topic.endswith("/angles"):
+                joint_angles_deg = list(map(float, data.split(",")))
+                joint_angles_rad = [math.radians(angle) for angle in joint_angles_deg]
+                self.ros_node.get_logger().info(f"📥 Received Joint Angles: {joint_angles_deg}")
+                
+
+                # 🔄 ใช้ FK คำนวณตำแหน่ง
+                if self.kinematics:
+                    x, y, z, roll, pitch, yaw = self.kinematics.compute_fk(joint_angles_rad)
+                    x_mm, y_mm, z_mm = x * 1000, y * 1000, z * 1000
+                    roll_deg, pitch_deg, yaw_deg = math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+                    self.ros_node.get_logger().info(f"✅ FK Computed Pose: X={x_mm}mm, Y={y_mm}mm, Z={z_mm}mm, Roll={roll_deg}°, Pitch={pitch_deg}°, Yaw={yaw_deg}°")
+                    self.update_cartesian_values(x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg)
+
+                self.update_joint_angles(joint_angles_deg, update_ui=True)
+                self.root.update_idletasks()
+                self.send_joint_angles()
+                
+
+        except Exception as e:
+            self.ros_node.get_logger().error(f"Error processing MQTT message: {e}")
+
+    def update_joint_angles(self, angles, update_ui=True):
+        """อัปเดตค่า Joint Angle UI และส่งออกไปทันที"""
+        self.ros_node.get_logger().info(f"📥 Received Raw Joint Angles: {angles}")
+
+        # ✅ ตรวจสอบว่าค่าที่ได้รับมีจำนวนตรงกับ joint_names
+        if len(angles) != len(self.joint_names):
+            self.ros_node.get_logger().error("❌ Error: จำนวน joint angles ไม่ตรงกับที่กำหนด")
+            return
+
+        # ✅ อัปเดตค่าในตัวแปร joint_values
+        for i, joint in enumerate(self.joint_names):
+            self.joint_values[joint] = angles[i]
+            self.ros_node.get_logger().info(f"Updated {joint}: {self.joint_values[joint]}°")
+
+        # ✅ อัปเดต UI
+        if update_ui:
+            for i, joint in enumerate(self.joint_names):
+                if joint in self.joint_value_labels:
+                    self.joint_value_labels[joint].config(text=f"{angles[i]:.2f}°")
+
+            # ✅ อัปเดตช่องกรอกค่าของ joint ปัจจุบัน
+            if self.current_joint in self.joint_names and hasattr(self, 'current_joint_entry'):
+                self.current_joint_entry.delete(0, 'end')
+                self.current_joint_entry.insert(0, str(self.joint_values[self.current_joint]))
+
+            # ✅ Refresh UI
+            self.root.update_idletasks()
+
+
+
+
+
+
+
+    def toggle_all_buttons(self, state):
+            """เปิดหรือปิดการใช้งานปุ่มทั้งหมด และเปลี่ยนสีปุ่มให้เป็นเทาเมื่อปิด"""
+            is_disabled = (state == "disable")
+
+            # ✅ ใช้ recursive function เพื่อตรวจสอบวิดเจ็ตทั้งหมด
+            def disable_recursively(widget):
+                """ปิดทุกวิดเจ็ตใน UI รวมถึงที่อยู่ในเฟรมซ้อนกัน"""
+                if isinstance(widget, ttk.Button) and widget != self.mqtt_toggle_button:
+                    widget["state"] = "disabled" if is_disabled else "normal"
+                    widget.configure(bootstyle="secondary" if is_disabled else "primary")  
+
+                elif isinstance(widget, (ttk.Entry, ttk.Combobox, ttk.Scale)):
+                    widget["state"] = "disabled" if is_disabled else "normal"
+
+                # ✅ ค้นหาและปิด widget ที่อยู่ใน frame ซ้อนกัน
+                if isinstance(widget, ttk.Frame):
+                    for child in widget.winfo_children():
+                        disable_recursively(child)
+
+            # ✅ ปิดทุก widget ที่อยู่ใน root และเฟรมทั้งหมด
+            for widget in self.root.winfo_children():
+                disable_recursively(widget)
+
+
+
+
+
 
     def execute_special_action(self):
         """ Execute a predefined sequence of joint positions """
@@ -455,33 +785,50 @@ class RobotControlUI:
         self.execute_sequence(sequence)
    
     def execute_home(self):
-        """ Move the robot to home position """
-        sequence = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
-        self.execute_sequence(sequence)
-    
-    def execute_sequence(self, sequence):
-        if not self.client.wait_for_service(timeout_sec=1.0):
-            self.ros_node.get_logger().error("Service /set_position is not available.")
-            return
+        """Move the robot to home position and publish 'm' to /control_mode/state"""
+        self.ros_node.get_logger().info("📢 Sending 'm' to switch to Home Position Mode")
+        
+        # ✅ ส่ง 'm' ไปที่ /control_mode/state
+        msg = String()
+        msg.data = 'm'
+        self.control_mode_publisher.publish(msg)
 
-        for angles in sequence:
-            request = SetPosition.Request()
-            request.target_positions = list(map(float, angles))  # Ensure all values are float
-            future = self.client.call_async(request)
-            future.add_done_callback(self.handle_service_response)
-            self.ros_node.get_logger().info(f"Sent Sequence: {angles}")
-            rclpy.spin_until_future_complete(self.ros_node, future)
+        # ✅ เรียกฟังก์ชันให้หุ่นยนต์กลับ Home
+        # sequence = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+        # self.execute_sequence(sequence)
+        
+    # def execute_sequence(self, sequence):
+    #     if not self.client.wait_for_service(timeout_sec=1.0):
+    #         self.ros_node.get_logger().error("Service /set_position is not available.")
+    #         return
+
+    #     for angles in sequence:
+    #         request = SetPosition.Request()
+    #         request.target_positions = list(map(float, angles))  # Ensure all values are float
+    #         future = self.client.call_async(request)
+    #         future.add_done_callback(self.handle_service_response)
+    #         self.ros_node.get_logger().info(f"Sent Sequence: {angles}")
+    #         rclpy.spin_until_future_complete(self.ros_node, future)
             
-            # Add delay between actions
-            self.root.after(2000)
+    #         # Add delay between actions
+    #         self.root.after(2000)
  
     def set_mode(self, mode):
         if mode == self.control_mode:
             return
             
+        # บันทึกค่า joint_values ในโหมดปัจจุบันก่อนเปลี่ยนโหมด
+        if hasattr(self, 'current_joint_entry') and self.control_mode == "velocity":
+            self.save_current_joint_value()
+                
         self.control_mode = mode
         self.publish_control_mode_state()
         self.create_ui()
+        
+        # พิมพ์ค่า joint_values หลังจากเปลี่ยนโหมดเพื่อตรวจสอบว่าค่ายังคงอยู่
+        if hasattr(self, 'joint_values'):
+            self.ros_node.get_logger().info(f"Joint values after mode change: {self.joint_values}")
+
         
     def toggle_mode(self):
         # For backward compatibility
@@ -500,8 +847,10 @@ class RobotControlUI:
         
     def create_cartesian_ui(self):
         """Create UI for Cartesian coordinate control"""
-        # Initialize joint values dictionary to store calculated joint angles
-        self.joint_values = {joint: 0.0 for joint in self.joint_names}
+
+        # ตรวจสอบว่ามีค่า joint_values อยู่แล้วหรือไม่ ถ้าไม่มีจึงสร้างขึ้นใหม่
+        if not hasattr(self, 'joint_values'):
+            self.joint_values = {joint: 0.0 for joint in self.joint_names}
         
         # Create a simple title
         ttk.Label(self.root, text="Cartesian Control", font=("Arial", 36)).pack(pady=20)
@@ -572,6 +921,9 @@ class RobotControlUI:
         
         # Display current joint values in right frame
         ttk.Label(right_frame, text="Current Joint Values", font=("Arial", 24, "bold")).pack(pady=10)
+        self.btn_home = ttk.Button(btn_frame, text="Home", bootstyle="primary", width=30, padding=30, command=self.execute_home)
+        self.btn_home.pack(side="left", padx=20)
+
         
         self.joint_values_frame = ttk.Frame(right_frame)
         self.joint_values_frame.pack(pady=10, fill="x")
@@ -648,6 +1000,7 @@ class RobotControlUI:
         
         # Update preset buttons
         self.update_preset_buttons()
+        self.root.update_idletasks()
     
     def update_preset_buttons(self):
         """Update preset buttons for the current joint"""
@@ -707,23 +1060,43 @@ class RobotControlUI:
             self.toggle_actions_button.config(text="Show Special Actions")
     
     def send_joint_angles(self):
-        # Save the current joint value before sending (only in velocity mode)
         if self.control_mode == "velocity" and hasattr(self, 'current_joint_entry'):
             self.save_current_joint_value()
-        
-        # Get all joint values
-        angles = [self.joint_values[joint] for joint in self.joint_names]
-        
+
+        # ตรวจสอบค่าก่อนสร้าง angles array
+        for joint in self.joint_names:
+            self.ros_node.get_logger().info(f"🔍 Before Copy: {joint} = {self.joint_values[joint]}")
+
+        self.ros_node.get_logger().info(f"🔍 Full Joint Values before copying: {self.joint_values}")
+
+        angles = [self.joint_values[joint] for joint in self.joint_names].copy()
+
+        # ตรวจสอบค่าหลัง Copy
+        for i, joint in enumerate(self.joint_names):
+            self.ros_node.get_logger().info(f"🔍 After Copy: {joint} = {angles[i]}")
+
+        self.ros_node.get_logger().info(f"🔍 Full Joint Values before sending: {angles}")
+
+        angles[2] = -angles[2]
+        angles[3] = -angles[3]
+        angles[4] = angles[4] - angles[3]
+
+        self.ros_node.get_logger().info(f"🔍 Modified Joint Angles before sending: {angles}")
+
         if not self.client.wait_for_service(timeout_sec=1.0):
             self.ros_node.get_logger().error("Service /set_position is not available.")
             return
-        
+
         request = SetPosition.Request()
         request.target_positions = angles
-        
+
         future = self.client.call_async(request)
         future.add_done_callback(self.handle_service_response)
-    
+
+        self.root.update()
+
+
+
     def handle_service_response(self, future):
         try:
             response = future.result()
@@ -811,46 +1184,55 @@ class RobotControlUI:
             self.ros_node.get_logger().error(f"Error sending cartesian command: {str(e)}")
             import traceback
             self.ros_node.get_logger().error(traceback.format_exc())
-    
+        
     def handle_solve_ik_response(self, future):
         """Handle the response from the SolveIK service"""
         try:
             response = future.result()
             self.ros_node.get_logger().info(f"SolveIK Response: success={response.success}, message={response.message}")
-            
+
             if response.success:
-                # Convert radians to degrees if needed
+                # Debug: เช็คค่าก่อนแปลง
                 joint_angles = response.joint_angles
-                
-                # Check if angles are in radians (assuming values > 3.14 are degrees)
-                if all(abs(angle) <= math.pi for angle in joint_angles):
+                self.ros_node.get_logger().info(f"Raw Joint Angles from IK: {joint_angles}")
+
+                # ตรวจสอบว่า joint_angles มีค่าและจำนวนพอเพียง
+                if not joint_angles or len(joint_angles) != len(self.joint_names):
+                    self.ros_node.get_logger().error(f"Invalid joint angles received: {joint_angles}")
+                    return  # ไม่ส่งคำสั่งหากค่าไม่ถูกต้อง
+
+                # แปลงเป็น degrees หากอยู่ในช่วงของ radians
+                if max(map(abs, joint_angles)) <= math.pi:  # ถ้าค่าสูงสุดไม่เกิน pi แสดงว่าเป็น radians
                     joint_angles_deg = [math.degrees(angle) for angle in joint_angles]
-                    self.ros_node.get_logger().info("Converting radians to degrees")
+                    self.ros_node.get_logger().info("Detected radians, converting to degrees")
                 else:
-                    joint_angles_deg = joint_angles
-                
-                self.ros_node.get_logger().info(f"Joint angles (deg): {joint_angles_deg}")
-                
-                # Store the calculated joint angles in the joint_values dictionary
+                    joint_angles_deg = joint_angles  # ใช้ค่าเดิมหากเป็น degrees อยู่แล้ว
+
+                self.ros_node.get_logger().info(f"Converted Joint Angles (deg): {joint_angles_deg}")
+
+                # ✅ อัปเดตค่าลง self.joint_values
                 for i, joint in enumerate(self.joint_names):
-                    if i < len(joint_angles_deg):
-                        self.joint_values[joint] = joint_angles_deg[i]
-                
-                # Update joint value display
+                    self.joint_values[joint] = joint_angles_deg[i]
+
+                # Debug: เช็คค่าก่อนส่งคำสั่ง
+                self.ros_node.get_logger().info(f"Final Joint Values to Send: {self.joint_values}")
+
+                # ✅ อัปเดต UI ให้แสดงค่าล่าสุด
                 for i, joint in enumerate(self.joint_names):
-                    if i < len(joint_angles_deg):
-                        self.joint_value_labels[joint].config(text=f"{joint_angles_deg[i]:.2f}°")
-                
-                # Use the same method as in velocity mode to send the joint angles
+                    self.joint_value_labels[joint].config(text=f"{joint_angles_deg[i]:.2f}°")
+
+                # ✅ ส่งค่าไปยัง ROS /set_position
                 self.send_joint_angles()
+
             else:
                 self.ros_node.get_logger().error(f"IK solution failed: {response.message}")
-                
+
         except Exception as e:
             self.ros_node.get_logger().error(f"Error handling SolveIK response: {str(e)}")
             import traceback
             self.ros_node.get_logger().error(traceback.format_exc())
-    
+
+        
     def navigate_joint_selection(self, direction):
         """Navigate joint selection with keyboard"""
         current_index = self.joint_names.index(self.joint_selector.get())

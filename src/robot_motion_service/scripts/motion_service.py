@@ -35,9 +35,9 @@ class RobotController(Node):
 
         # Joint limits (degrees)
         self.joint_limits = {
-            'joint1': (-134, 134),
-            'joint2': (-90, 0),
-            'joint3': (-90, 45),
+            'joint1': (-180, 180),
+            'joint2': (-90, 90),
+            'joint3': (-90, 90),
             'joint4': (-180, 180),
             'joint5': (-180, 180),
             'joint6': (-180, 180)
@@ -88,16 +88,19 @@ class RobotController(Node):
             return
         
         self.current_mode = mode
-        print(mode)
-        if mode == 'v':
-            self.get_logger().info("Switching to Velocity Mode: Sending Home Position First")
-            self.initialize_robot_position()
+        self.get_logger().info(mode)
+
+        if mode == 'm':  # 🔹 ถ้าเป็น 'm' ให้ส่งหุ่นยนต์กลับ Home
+            self.get_logger().info("Switching to Home Position before enabling Velocity Mode")
+            self.initialize_robot_position()  # ส่งกลับ Home ก่อน
             time.sleep(0.5)
-            self.send_initial_trajectory()
+            self.send_initial_trajectory()  # ส่งคำสั่งไป Home
             time.sleep(3)
-            self.switch_controller('velocity_controller', activate=True)
+            self.switch_controller('velocity_controller', activate=True)  # แล้วค่อยสลับไป velocity mode
         else:
             self.get_logger().info("Switched to Jog Mode")
+
+
 
     def initialize_robot_position(self):
         """Set all joint positions to 0 and switch to velocity controller."""

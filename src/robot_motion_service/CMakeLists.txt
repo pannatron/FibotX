@@ -26,8 +26,9 @@ ament_export_dependencies(rosidl_default_runtime)
 install(PROGRAMS
   scripts/motion_service.py
   scripts/Robot_Ui.py
-  scripts/kinematics.py
+  scripts/kinematic_fibox.py
   scripts/kinematics_service.py
+  scripts/mqtt_sub_service.py
   DESTINATION lib/${PROJECT_NAME}
 )
 # Install launch files

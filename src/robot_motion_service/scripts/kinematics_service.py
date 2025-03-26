@@ -4,7 +4,7 @@ import rclpy
 import numpy as np
 from rclpy.node import Node
 from robot_motion_service.srv import SolveIK
-from kinematics import FiboX_Borot
+from kinematic_fibox import FiboX_Borot
 
 class KinematicsService(Node):
     def __init__(self):
@@ -33,31 +33,42 @@ class KinematicsService(Node):
             pitch = request.ry
             yaw = request.rz
             
-            self.get_logger().info(f'Received IK request: x={x}, y={y}, z={z}, roll={roll}, pitch={pitch}, yaw={yaw}')
+            position = [x/1000, y/1000, z/1000]
+            orientation = [roll, pitch, yaw]
             
+            # Log input values
+            self.get_logger().info(f"🔹 Received IK request:")
+            self.get_logger().info(f"   - Position (mm): x={x}, y={y}, z={z}")
+            self.get_logger().info(f"   - Orientation (rad): roll={roll}, pitch={pitch}, yaw={yaw}")
+
             # Compute inverse kinematics
-            ik_solutions = self.kinematics.compute_ink(x, y, z, roll, pitch, yaw)
+            ik_solutions = self.kinematics.compute_ink(position, orientation, apply_adjustment=False)
             
+            # Log IK solver inputs and outputs
+            self.get_logger().info(f"🔸 Sent to IK Solver:")
+            self.get_logger().info(f"   - Position (m): x={x:.3f}, y={y:.3f}, z={z:.3f}")
+            self.get_logger().info(f"   - Orientation (rad): roll={roll:.3f}, pitch={pitch:.3f}, yaw={yaw:.3f}")
+
             if not ik_solutions:
                 response.success = False
                 response.message = "No IK solution found for the given pose"
                 response.joint_angles = []
+                self.get_logger().warning("❌ No IK solution found.")
                 return response
             
-            # Get the first solution (we could implement a selection strategy here)
-            best_solution = ik_solutions[0]
-            
-            # Convert radians to degrees for the response
-            joint_angles_degrees = [np.degrees(angle) for angle in best_solution]
-            
+            # Get the first solution (or implement a selection strategy)
+            best_solution = ik_solutions  
+
+            # ✅ Send joint angles in radians (NO conversion to degrees)
             response.success = True
             response.message = "IK solution found successfully"
-            response.joint_angles = joint_angles_degrees
+            response.joint_angles = best_solution  # Send radians directly
             
-            self.get_logger().info(f'Found IK solution: {joint_angles_degrees}')
-            
+            # Log IK output (joint angles in radians)
+            self.get_logger().info(f"✅ Found IK Solution (radians): {best_solution}")
+
         except Exception as e:
-            self.get_logger().error(f'Error solving IK: {str(e)}')
+            self.get_logger().error(f"❌ Error solving IK: {str(e)}")
             response.success = False
             response.message = f"Error: {str(e)}"
             response.joint_angles = []
